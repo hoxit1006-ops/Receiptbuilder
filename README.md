@@ -1,41 +1,27 @@
 # Receipt Spending Tracker (Web)
 
 A mobile-friendly web app where you can take a picture of a receipt and get:
-- auto-detected items + prices
+- item list + prices + quantities
 - automatic category mapping (including **Fruits** and **Junk Food**)
-- total spend
+- totals from receipt text (**subtotal / tax / total**)
+- total spent from parsed items
 - potential savings if junk food was skipped
 
-## New: AI-assisted extraction with Ollama
-If OCR misses lines, you can now use **Ollama** to improve extraction:
-1. Scan photo (or paste receipt text manually).
-2. Enter your local Ollama model name (example: `llama3.1:8b`).
-3. Tap **AI parse with Ollama**.
-4. Review/edit items and save.
+## New: AI-assisted extraction (optional)
+If OCR misses lines, you can use ChatGPT extraction:
+1. Scan/upload receipt (or paste text).
+2. Paste your OpenAI API key in the app.
+3. Tap **AI parse from OCR text**.
+4. Review/edit detected items before saving.
 
-The model name is stored in your browser local storage for convenience.
+> The API key is used in your browser request and is not stored in localStorage.
 
-## Requirements for Ollama
-- Install Ollama locally: https://ollama.com
-- Pull a model, for example:
-
-```bash
-ollama pull llama3.1:8b
-```
-
-- Run Ollama server (default):
-
-```bash
-ollama serve
-```
-
-The web app calls `http://localhost:11434/api/generate`.
-
-## What is improved now
-- Better OCR parsing for common receipt line patterns.
-- Ollama fallback that converts noisy OCR text into structured JSON items.
-- Merchant auto-fill from OCR/AI when possible.
-- All extracted rows stay editable before save.
+## How it works
+1. Photo OCR via Tesseract.js reads receipt text.
+2. Rule-based parser extracts items + prices + quantity + categories.
+3. Parser also extracts subtotal/tax/total fields when present.
+4. Optional ChatGPT parse improves extraction quality on messy receipts.
+5. You review/edit everything before saving.
 
 ## Run locally
 
@@ -48,11 +34,11 @@ Open `http://127.0.0.1:4173`.
 ## iPhone usage
 - Open the URL in Safari on your iPhone.
 - Take a receipt photo.
-- If OCR misses lines, paste text and/or use Ollama parse.
-- Review rows, then save.
-- Delete any saved receipt from history using the **Delete receipt** button.
+- Let OCR run.
+- If needed, use pasted text fallback or AI parse.
+- Save receipt after review.
 
 ## Notes
-- OCR and AI quality depends on image clarity.
-- Keep receipts flat, well-lit, and fully in frame.
-- Ollama parsing requires the browser/device to reach your Ollama server URL.
+- OCR accuracy depends on image quality.
+- Keep receipt flat, well-lit, and fully in frame.
+- AI extraction requires internet and a valid OpenAI API key.

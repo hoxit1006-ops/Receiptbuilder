@@ -1,5 +1,4 @@
-const STORAGE_KEY = 'receipt_spending_tracker_v5';
-const OLLAMA_MODEL_STORAGE = 'receipt_tracker_ollama_model';
+const STORAGE_KEY = 'receipt_spending_tracker_v4';
 const CATEGORIES = ['Fruits', 'Junk Food', 'Vegetables', 'Protein', 'Dairy', 'Drinks', 'Snacks', 'Household', 'Other'];
 const JUNK_CATEGORIES = new Set(['Junk Food']);
 
@@ -19,9 +18,9 @@ const dateInput = document.getElementById('purchaseDate');
 const photoInput = document.getElementById('photo');
 const photoPreview = document.getElementById('photoPreview');
 const ocrTextInput = document.getElementById('ocrText');
-const ollamaModelInput = document.getElementById('ollamaModel');
 const parseTextButton = document.getElementById('parseText');
 const aiParseButton = document.getElementById('aiParse');
+const openaiKeyInput = document.getElementById('openaiKey');
 const scanReceiptButton = document.getElementById('scanReceipt');
 const scanStatus = document.getElementById('scanStatus');
 const itemsContainer = document.getElementById('items');
@@ -29,11 +28,13 @@ const addItemButton = document.getElementById('addItem');
 const saveReceiptButton = document.getElementById('saveReceipt');
 const totalSpentEl = document.getElementById('totalSpent');
 const junkSavingsEl = document.getElementById('junkSavings');
+const receiptTotalsInfoEl = document.getElementById('receiptTotalsInfo');
 const categorySummaryEl = document.getElementById('categorySummary');
 const receiptListEl = document.getElementById('receiptList');
 
 let receipts = [];
 let imageDataUrl = '';
+let currentParsedTotals = { subtotal: 0, tax: 0, total: 0 };
 
 function createEmptyItem(item = {}) {
   return {
@@ -45,34 +46,46 @@ function createEmptyItem(item = {}) {
 }
 
 function guessCategory(name) {
-  const lower = name.toLowerCase();
+  const lower = String(name || '').toLowerCase();
   const matched = Object.entries(CATEGORY_KEYWORDS).find(([, keywords]) => keywords.some((keyword) => lower.includes(keyword)));
   return matched ? matched[0] : 'Other';
 }
 
 function cleanupLine(line) {
-  return line
-    .replace(/[|]/g, ' ')
-    .replace(/[“”]/g, '"')
-    .replace(/[‘’]/g, "'")
-    .replace(/\s+/g, ' ')
-    .trim();
+  return line.replace(/[|]/g, ' ').replace(/[“”]/g, '"').replace(/[‘’]/g, "'").replace(/\s+/g, ' ').trim();
 }
 
 function extractMerchant(text) {
-  const lines = text
-    .split(/\r?\n/)
-    .map(cleanupLine)
-    .filter(Boolean)
-    .slice(0, 6);
-  const candidate = lines.find((line) => /[A-Za-z]{3,}/.test(line) && !/receipt|invoice|thank|date|time/i.test(line));
-  return candidate || '';
+  const lines = String(text).split(/\r?\n/).map(cleanupLine).filter(Boolean).slice(0, 6);
+  return lines.find((line) => /[A-Za-z]{3,}/.test(line) && !/receipt|invoice|thank|date|time/i.test(line)) || '';
+}
+
+function amountFromString(value) {
+  const normalized = String(value || '').replace(/[^\d.,-]/g, '').replace(',', '.');
+  const n = Number(normalized);
+  return Number.isFinite(n) ? n : 0;
+}
+
+function parseTotals(text) {
+  const lines = String(text).split(/\r?\n/).map(cleanupLine).filter(Boolean);
+  const result = { subtotal: 0, tax: 0, total: 0 };
+
+  for (const line of lines) {
+    const amountMatch = line.match(/(\d{1,4}[\.,]\d{2})\s*$/);
+    if (!amountMatch) continue;
+    const amount = amountFromString(amountMatch[1]);
+
+    if (/subtotal/i.test(line)) result.subtotal = amount;
+    else if (/\btax\b|vat/i.test(line)) result.tax = amount;
+    else if (/\btotal\b|amount due|grand total/i.test(line)) result.total = amount;
+  }
+
+  return result;
 }
 
 function parseReceiptText(text) {
-  const lines = text.split(/\r?\n/).map(cleanupLine).filter(Boolean);
+  const lines = String(text).split(/\r?\n/).map(cleanupLine).filter(Boolean);
   const skipPattern = /subtotal|tax|total|balance|change|visa|mastercard|debit|credit|cash|thank|invoice|order|auth|payment/i;
-
   const parsedItems = [];
   const seen = new Set();
 
@@ -83,12 +96,11 @@ function parseReceiptText(text) {
     if (!tokens.length) continue;
 
     const lastToken = tokens[tokens.length - 1];
-    const price = Number(lastToken.replace(',', '.'));
+    const price = amountFromString(lastToken);
     if (!Number.isFinite(price) || price <= 0 || price > 9999) continue;
 
-    let quantity = 1;
     const qtyMatch = line.match(/(?:^|\s)(\d+)\s*[xX](?:\s|$)/);
-    if (qtyMatch) quantity = Math.max(1, Number(qtyMatch[1]));
+    const quantity = qtyMatch ? Math.max(1, Number(qtyMatch[1])) : 1;
 
     const name = line
       .replace(/\$?\s*\d{1,4}[\.,]\d{2}\s*$/g, '')
@@ -105,96 +117,65 @@ function parseReceiptText(text) {
     parsedItems.push({ name, price, quantity, category: guessCategory(name) });
   }
 
+  currentParsedTotals = parseTotals(text);
   return parsedItems;
 }
 
-function normalizeAiItems(items) {
-  if (!Array.isArray(items)) return [];
-  return items
-    .map((item) => {
-      const name = String(item?.name || '').trim();
-      const price = Number(item?.price || 0);
-      const quantity = Math.max(1, Number(item?.quantity || 1));
-      let category = String(item?.category || '').trim();
-      if (!CATEGORIES.includes(category)) category = guessCategory(name);
-      return { name, price, quantity, category };
-    })
-    .filter((item) => item.name && Number.isFinite(item.price) && item.price > 0);
-}
+async function parseWithOpenAI(rawText, apiKey) {
+  const prompt = `Extract structured receipt data. Return JSON only with shape: {"merchant":"string","subtotal":number,"tax":number,"total":number,"items":[{"name":"string","price":number,"quantity":number,"category":"Fruits|Junk Food|Vegetables|Protein|Dairy|Drinks|Snacks|Household|Other"}]}. Receipt text:\n${rawText}`;
 
-function safeJsonParse(text) {
-  try {
-    return JSON.parse(text);
-  } catch {
-    return null;
-  }
-}
-
-function extractJsonObject(text) {
-  const start = text.indexOf('{');
-  const end = text.lastIndexOf('}');
-  if (start === -1 || end === -1 || end <= start) return null;
-  return safeJsonParse(text.slice(start, end + 1));
-}
-
-async function parseWithOllama(rawText) {
-  const model = ollamaModelInput.value.trim() || 'llama3.1:8b';
-  localStorage.setItem(OLLAMA_MODEL_STORAGE, model);
-
-  const prompt = `Extract receipt data and return STRICT JSON only with shape:
-{
-  "merchant": string,
-  "items": [{"name": string, "price": number, "quantity": number, "category": one of ${CATEGORIES.join(', ')} }]
-}
-Rules:
-- Include line items only.
-- Ignore subtotal/tax/total/payment lines.
-- Infer category if missing.
-- quantity=1 when unknown.
-Receipt text:\n${rawText}`;
-
-  const response = await fetch('http://localhost:11434/api/generate', {
+  const res = await fetch('https://api.openai.com/v1/responses', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${apiKey}`
+    },
     body: JSON.stringify({
-      model,
-      prompt,
-      stream: false,
-      format: 'json',
-      options: { temperature: 0 }
+      model: 'gpt-4.1-mini',
+      input: prompt,
+      temperature: 0
     })
   });
 
-  if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(`Ollama error: ${response.status} ${errorText}`);
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`OpenAI API error ${res.status}: ${body}`);
   }
 
-  const payload = await response.json();
-  const outputText = payload?.response || '';
-  const parsed = safeJsonParse(outputText) || extractJsonObject(outputText);
+  const data = await res.json();
+  const output = data.output_text || '';
+  const jsonStart = output.indexOf('{');
+  const jsonEnd = output.lastIndexOf('}');
+  if (jsonStart < 0 || jsonEnd < 0) throw new Error('No JSON returned by AI');
 
-  if (!parsed || typeof parsed !== 'object') {
-    throw new Error('Ollama response did not return valid JSON.');
-  }
+  const parsed = JSON.parse(output.slice(jsonStart, jsonEnd + 1));
+  const items = Array.isArray(parsed.items) ? parsed.items : [];
 
   return {
     merchant: String(parsed.merchant || '').trim(),
-    items: normalizeAiItems(parsed.items)
+    subtotal: amountFromString(parsed.subtotal),
+    tax: amountFromString(parsed.tax),
+    total: amountFromString(parsed.total),
+    items: items
+      .map((item) => ({
+        name: String(item.name || '').trim(),
+        price: amountFromString(item.price),
+        quantity: Math.max(1, Number(item.quantity || 1)),
+        category: CATEGORIES.includes(item.category) ? item.category : guessCategory(item.name || '')
+      }))
+      .filter((item) => item.name && item.price > 0)
   };
 }
 
 function addItemRow(item = createEmptyItem()) {
   const row = document.createElement('div');
   row.className = 'item-row';
-
   const nameInput = document.createElement('input');
   nameInput.placeholder = 'Item name';
   nameInput.value = item.name;
 
   const grid = document.createElement('div');
   grid.className = 'grid-2';
-
   const priceInput = document.createElement('input');
   priceInput.placeholder = 'Price';
   priceInput.inputMode = 'decimal';
@@ -238,44 +219,35 @@ function readItemRows() {
       const [price, quantity] = grid.children;
       return {
         name: name.value.trim(),
-        price: Number(price.value || 0),
-        quantity: Number(quantity.value || 1),
+        price: amountFromString(price.value),
+        quantity: Math.max(1, Number(quantity.value || 1)),
         category: category.value || 'Other'
       };
     })
-    .filter((item) => item.name && item.price > 0 && item.quantity > 0);
+    .filter((item) => item.name && item.price > 0);
 }
 
-function calculateTotal(items) {
-  return items.reduce((sum, item) => sum + item.price * item.quantity, 0);
-}
-
-function calculateJunkTotal(items) {
-  return items.filter((item) => JUNK_CATEGORIES.has(item.category)).reduce((sum, item) => sum + item.price * item.quantity, 0);
-}
-
-function saveState() {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(receipts));
-}
-
-function loadState() {
-  const raw = localStorage.getItem(STORAGE_KEY);
-  receipts = raw ? JSON.parse(raw) : [];
-}
+function calculateTotal(items) { return items.reduce((sum, item) => sum + item.price * item.quantity, 0); }
+function calculateJunkTotal(items) { return items.filter((item) => JUNK_CATEGORIES.has(item.category)).reduce((sum, item) => sum + item.price * item.quantity, 0); }
+function saveState() { localStorage.setItem(STORAGE_KEY, JSON.stringify(receipts)); }
+function loadState() { receipts = JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]'); }
 
 function renderSummary() {
   const total = receipts.reduce((sum, receipt) => sum + receipt.total, 0);
   const junkTotal = receipts.reduce((sum, receipt) => sum + (receipt.junkSpend || 0), 0);
+  const totalsAgg = receipts.reduce((acc, receipt) => {
+    acc.subtotal += receipt.subtotal || 0;
+    acc.tax += receipt.tax || 0;
+    acc.total += receipt.receiptTotal || 0;
+    return acc;
+  }, { subtotal: 0, tax: 0, total: 0 });
 
   totalSpentEl.textContent = `$${total.toFixed(2)}`;
   junkSavingsEl.textContent = `Potential savings (skip junk food): $${junkTotal.toFixed(2)}`;
+  receiptTotalsInfoEl.textContent = `Parsed receipt totals: Subtotal $${totalsAgg.subtotal.toFixed(2)}, Tax $${totalsAgg.tax.toFixed(2)}, Total $${totalsAgg.total.toFixed(2)}`;
 
   const byCategory = {};
-  receipts.forEach((receipt) => {
-    receipt.items.forEach((item) => {
-      byCategory[item.category] = (byCategory[item.category] || 0) + item.price * item.quantity;
-    });
-  });
+  receipts.forEach((receipt) => receipt.items.forEach((item) => { byCategory[item.category] = (byCategory[item.category] || 0) + item.price * item.quantity; }));
 
   categorySummaryEl.innerHTML = '';
   const entries = Object.entries(byCategory).sort((a, b) => b[1] - a[1]);
@@ -287,14 +259,6 @@ function renderSummary() {
     chip.textContent = `${category}: $${amount.toFixed(2)}`;
     categorySummaryEl.appendChild(chip);
   });
-}
-
-
-function deleteReceipt(receiptId) {
-  receipts = receipts.filter((receipt) => receipt.id !== receiptId);
-  saveState();
-  renderSummary();
-  renderReceipts();
 }
 
 function renderReceipts() {
@@ -309,19 +273,12 @@ function renderReceipts() {
     card.innerHTML = `
       <h3>${receipt.merchant}</h3>
       <div class="small">${receipt.purchaseDate}</div>
-      <div class="small">Total spent: $${receipt.total.toFixed(2)}</div>
+      <div class="small">Items total: $${receipt.total.toFixed(2)}</div>
+      <div class="small">Receipt subtotal/tax/total: $${(receipt.subtotal || 0).toFixed(2)} / $${(receipt.tax || 0).toFixed(2)} / $${(receipt.receiptTotal || 0).toFixed(2)}</div>
       <div class="small">Possible junk-food savings: $${(receipt.junkSpend || 0).toFixed(2)}</div>
       <div class="small" style="margin-top: 8px;">${itemsHtml}</div>
       ${receipt.imageDataUrl ? `<img class="thumb" src="${receipt.imageDataUrl}" alt="${receipt.merchant} receipt" />` : ''}
-      <button class="btn-danger receipt-delete" data-receipt-id="${receipt.id}" type="button">Delete receipt</button>
     `;
-
-    const deleteButton = card.querySelector('.receipt-delete');
-    deleteButton?.addEventListener('click', () => {
-      const confirmed = window.confirm('Delete this receipt from history?');
-      if (confirmed) deleteReceipt(receipt.id);
-    });
-
     receiptListEl.appendChild(card);
   });
 }
@@ -332,6 +289,7 @@ function resetForm() {
   photoInput.value = '';
   ocrTextInput.value = '';
   imageDataUrl = '';
+  currentParsedTotals = { subtotal: 0, tax: 0, total: 0 };
   photoPreview.hidden = true;
   photoPreview.removeAttribute('src');
   scanStatus.textContent = '';
@@ -341,46 +299,38 @@ function resetForm() {
 
 function applyParsedItems(parsedItems, source = 'scan') {
   if (!parsedItems.length) {
-    scanStatus.textContent = `Could not parse items from ${source}. Add or edit items manually.`;
+    scanStatus.textContent = `Could not parse items from ${source}. You can still add/edit items manually.`;
     if (!itemsContainer.children.length) addItemRow();
     return;
   }
-
   setItemRows(parsedItems);
   scanStatus.textContent = `Parsed ${parsedItems.length} item(s) from ${source}. Review before saving.`;
 }
 
 async function scanReceiptWithOcr() {
-  if (!imageDataUrl) {
-    alert('Please take/upload a receipt photo first.');
-    return;
-  }
-
+  if (!imageDataUrl) return alert('Please take/upload a receipt photo first.');
   scanReceiptButton.disabled = true;
   scanStatus.textContent = 'Scanning receipt photo… this can take ~5-20 seconds.';
 
   try {
     if (!window.Tesseract) {
-      scanStatus.textContent = 'OCR library unavailable. Use pasted text or Ollama parse fallback.';
+      scanStatus.textContent = 'OCR unavailable here. Use pasted text fallback.';
       return;
     }
 
     const result = await window.Tesseract.recognize(imageDataUrl, 'eng', {
-      logger: (m) => {
-        if (m?.status === 'recognizing text') scanStatus.textContent = `Scanning receipt photo… ${Math.round((m.progress || 0) * 100)}%`;
-      }
+      logger: (m) => { if (m?.status === 'recognizing text') scanStatus.textContent = `Scanning receipt photo… ${Math.round((m.progress || 0) * 100)}%`; }
     });
 
     const rawText = result?.data?.text || '';
     ocrTextInput.value = rawText;
-
     const guessedMerchant = extractMerchant(rawText);
     if (!merchantInput.value.trim() && guessedMerchant) merchantInput.value = guessedMerchant;
 
     applyParsedItems(parseReceiptText(rawText), 'photo OCR');
   } catch (error) {
     console.error('OCR scan error', error);
-    scanStatus.textContent = 'Scan failed. Try clearer photo or use AI parse with Ollama.';
+    scanStatus.textContent = 'Scan failed. Try clearer photo or use pasted text/AI parse.';
   } finally {
     scanReceiptButton.disabled = false;
   }
@@ -393,7 +343,6 @@ photoInput.addEventListener('change', () => {
     photoPreview.hidden = true;
     return;
   }
-
   const reader = new FileReader();
   reader.onload = async () => {
     imageDataUrl = String(reader.result || '');
@@ -407,7 +356,6 @@ photoInput.addEventListener('change', () => {
 parseTextButton.addEventListener('click', () => {
   const text = ocrTextInput.value.trim();
   if (!text) return alert('Paste receipt text first.');
-
   const guessedMerchant = extractMerchant(text);
   if (!merchantInput.value.trim() && guessedMerchant) merchantInput.value = guessedMerchant;
   applyParsedItems(parseReceiptText(text), 'pasted text');
@@ -415,30 +363,23 @@ parseTextButton.addEventListener('click', () => {
 
 aiParseButton.addEventListener('click', async () => {
   const text = ocrTextInput.value.trim();
-  if (!text) return alert('Paste OCR text first (or scan photo first).');
+  const apiKey = openaiKeyInput.value.trim();
+  if (!text) return alert('Scan or paste receipt text first.');
+  if (!apiKey) return alert('Enter OpenAI API key first.');
 
   aiParseButton.disabled = true;
-  scanStatus.textContent = 'Sending receipt text to Ollama for better extraction…';
-
+  scanStatus.textContent = 'Asking ChatGPT to extract receipt details…';
   try {
-    const ai = await parseWithOllama(text);
-
+    const ai = await parseWithOpenAI(text, apiKey);
     if (!merchantInput.value.trim() && ai.merchant) merchantInput.value = ai.merchant;
-    if (ai.items.length) {
-      applyParsedItems(ai.items, 'Ollama AI parse');
-    } else {
-      scanStatus.textContent = 'Ollama parse returned no items. Keeping current rows so you can edit manually.';
-    }
+    currentParsedTotals = { subtotal: ai.subtotal, tax: ai.tax, total: ai.total };
+    applyParsedItems(ai.items, 'ChatGPT');
   } catch (error) {
     console.error(error);
-    scanStatus.textContent = `Ollama parse failed: ${error.message}`;
+    scanStatus.textContent = 'AI parse failed. Check key/network and try again.';
   } finally {
     aiParseButton.disabled = false;
   }
-});
-
-ollamaModelInput.addEventListener('change', () => {
-  if (ollamaModelInput.value.trim()) localStorage.setItem(OLLAMA_MODEL_STORAGE, ollamaModelInput.value.trim());
 });
 
 scanReceiptButton.addEventListener('click', scanReceiptWithOcr);
@@ -450,7 +391,7 @@ saveReceiptButton.addEventListener('click', () => {
   const items = readItemRows();
 
   if (!purchaseDate) return alert('Please choose a purchase date.');
-  if (!items.length) return alert('No items found yet. Scan photo, parse text, or use Ollama parse.');
+  if (!items.length) return alert('No items found yet. Scan, parse text, use AI parse, or add manually.');
 
   const receipt = {
     id: String(Date.now()),
@@ -458,6 +399,9 @@ saveReceiptButton.addEventListener('click', () => {
     purchaseDate,
     items,
     total: calculateTotal(items),
+    subtotal: currentParsedTotals.subtotal || 0,
+    tax: currentParsedTotals.tax || 0,
+    receiptTotal: currentParsedTotals.total || 0,
     junkSpend: calculateJunkTotal(items),
     imageDataUrl,
     createdAt: new Date().toISOString()
@@ -476,5 +420,4 @@ saveReceiptButton.addEventListener('click', () => {
   addItemRow();
   renderSummary();
   renderReceipts();
-  ollamaModelInput.value = localStorage.getItem(OLLAMA_MODEL_STORAGE) || 'llama3.1:8b';
 })();
